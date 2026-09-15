@@ -1,0 +1,2322 @@
+
+import os
+import csv
+import cv2
+import json
+import time
+import base64
+import ctypes
+import hashlib
+import secrets
+import threading
+import subprocess
+import tkinter as tk
+
+from datetime import datetime
+from pathlib import Path
+from tkinter import ttk, messagebox, simpledialog, filedialog
+
+import psutil
+from pynput import mouse, keyboard
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
+try:
+    from plyer import notification
+except ImportError:
+    notification = None
+
+try:
+    from cryptography.fernet import Fernet
+except ImportError:
+    Fernet = None
+
+
+# ============================================================
+# MouseSentinel V23
+# Professional Windows Personal Security Monitor
+# Single-file edition
+#
+# Defensive/local-use design:
+# - Does NOT record actual keyboard characters
+# - Does NOT capture passwords
+# - Does NOT bypass Windows authentication
+# - Camera capture is controlled by settings
+# ============================================================
+
+APP_NAME = "MouseSentinel V23"
+
+BASE_DIR = Path.home() / "MouseSentinel"
+LOG_DIR = BASE_DIR / "logs"
+CAPTURE_DIR = BASE_DIR / "captures"
+REPORT_DIR = BASE_DIR / "reports"
+
+CONFIG_FILE = BASE_DIR / "config.json"
+KEY_FILE = BASE_DIR / "secret.key"
+ENCRYPTED_LOG_FILE = LOG_DIR / "security_events.enc"
+CSV_EXPORT_FILE = REPORT_DIR / "security_events.csv"
+
+for folder in [BASE_DIR, LOG_DIR, CAPTURE_DIR, REPORT_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+
+DEFAULT_CONFIG = {
+    "timeout": 300,
+    "auto_lock": False,
+    "usb_lock": False,
+    "camera_capture": True,
+    "alarm": True,
+    "notifications": True,
+    "startup": False,
+    "test_mode": True,
+    "pin_hash": "",
+    "pin_salt": "",
+}
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+def load_config():
+    if not CONFIG_FILE.exists():
+        save_config(DEFAULT_CONFIG.copy())
+        return DEFAULT_CONFIG.copy()
+
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        config = DEFAULT_CONFIG.copy()
+        config.update(data)
+        return config
+
+    except Exception:
+        return DEFAULT_CONFIG.copy()
+
+
+def save_config(config):
+    temp_file = CONFIG_FILE.with_suffix(".tmp")
+
+    with open(temp_file, "w", encoding="utf-8") as file:
+        json.dump(config, file, indent=4)
+
+    os.replace(temp_file, CONFIG_FILE)
+
+
+CONFIG = load_config()
+
+
+# ============================================================
+# PIN Security
+# PBKDF2 instead of simple SHA-256
+# ============================================================
+
+def create_pin_hash(pin, salt=None):
+    if salt is None:
+        salt = secrets.token_bytes(16)
+
+    derived = hashlib.pbkdf2_hmac(
+        "sha256",
+        pin.encode("utf-8"),
+        salt,
+        200_000
+    )
+
+    return (
+        base64.b64encode(derived).decode(),
+        base64.b64encode(salt).decode()
+    )
+
+
+def verify_pin(pin):
+    stored_hash = CONFIG.get("pin_hash", "")
+    stored_salt = CONFIG.get("pin_salt", "")
+
+    if not stored_hash or not stored_salt:
+        return True
+
+    try:
+        salt = base64.b64decode(
+            stored_salt.encode()
+        )
+
+        derived = hashlib.pbkdf2_hmac(
+            "sha256",
+            pin.encode("utf-8"),
+            salt,
+            200_000
+        )
+
+        candidate = base64.b64encode(
+            derived
+        ).decode()
+
+        return secrets.compare_digest(
+            candidate,
+            stored_hash
+        )
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# Encryption
+# ============================================================
+
+def get_fernet():
+    if Fernet is None:
+        return None
+
+    try:
+        if not KEY_FILE.exists():
+            key = Fernet.generate_key()
+
+            with open(
+                KEY_FILE,
+                "wb"
+            ) as file:
+                file.write(key)
+
+        with open(
+            KEY_FILE,
+            "rb"
+        ) as file:
+            key = file.read()
+
+        return Fernet(key)
+
+    except Exception:
+        return None
+
+
+FERNET = get_fernet()
+
+
+def encrypted_log(event, details=""):
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    record = {
+        "timestamp": timestamp,
+        "event": event,
+        "details": details
+    }
+
+    raw = json.dumps(
+        record,
+        ensure_ascii=False
+    ).encode("utf-8")
+
+    try:
+        if FERNET:
+            encrypted = FERNET.encrypt(raw)
+
+            with open(
+                ENCRYPTED_LOG_FILE,
+                "ab"
+            ) as file:
+                file.write(
+                    encrypted + b"\n"
+                )
+
+        else:
+            # Fallback only if cryptography is unavailable.
+            # This is clearly marked as non-encrypted.
+            with open(
+                LOG_DIR / "security_events_fallback.log",
+                "a",
+                encoding="utf-8"
+            ) as file:
+                file.write(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False
+                    ) + "\n"
+                )
+
+    except Exception:
+        pass
+
+
+def read_encrypted_logs():
+    records = []
+
+    if not ENCRYPTED_LOG_FILE.exists():
+        return records
+
+    if not FERNET:
+        return records
+
+    try:
+        with open(
+            ENCRYPTED_LOG_FILE,
+            "rb"
+        ) as file:
+
+            for line in file:
+
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    decrypted = FERNET.decrypt(
+                        line
+                    )
+
+                    record = json.loads(
+                        decrypted.decode("utf-8")
+                    )
+
+                    records.append(record)
+
+                except Exception:
+                    continue
+
+    except Exception:
+        pass
+
+    return records
+
+
+# ============================================================
+# Utility
+# ============================================================
+
+def now():
+    return datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def notify_user(title, message):
+    if not CONFIG.get(
+        "notifications",
+        True
+    ):
+        return
+
+    try:
+        if notification:
+            notification.notify(
+                title=title,
+                message=message,
+                app_name=APP_NAME,
+                timeout=5
+            )
+    except Exception:
+        pass
+
+
+def alarm():
+    if not CONFIG.get(
+        "alarm",
+        True
+    ):
+        return
+
+    try:
+        if winsound:
+
+            for _ in range(3):
+                winsound.Beep(
+                    1200,
+                    300
+                )
+                time.sleep(0.1)
+
+    except Exception:
+        pass
+
+
+def windows_lock():
+    try:
+        return bool(
+            ctypes.windll.user32.LockWorkStation()
+        )
+    except Exception:
+        return False
+
+
+# ============================================================
+# Main Application
+# ============================================================
+
+class MouseSentinel:
+
+    def __init__(self, root):
+
+        self.root = root
+
+        self.root.title(
+            APP_NAME
+        )
+
+        self.root.geometry(
+            "1120x730"
+        )
+
+        self.root.minsize(
+            950,
+            620
+        )
+
+        self.root.configure(
+            bg="#0f172a"
+        )
+
+        # Runtime state
+        self.running = False
+        self.locking = False
+        self.closing = False
+
+        self.mouse_events = 0
+        self.keyboard_events = 0
+        self.security_events = 0
+
+        self.last_activity = time.time()
+
+        self.usb_state = set()
+
+        self.mouse_listener = None
+        self.keyboard_listener = None
+
+        # UI variables
+        self.status_var = tk.StringVar(
+            value="OFFLINE"
+        )
+
+        self.score_var = tk.StringVar(
+            value="100%"
+        )
+
+        self.mouse_var = tk.StringVar(
+            value="0"
+        )
+
+        self.keyboard_var = tk.StringVar(
+            value="0"
+        )
+
+        self.inactive_var = tk.StringVar(
+            value="00:00"
+        )
+
+        self.cpu_var = tk.StringVar(
+            value="CPU: --"
+        )
+
+        self.ram_var = tk.StringVar(
+            value="RAM: --"
+        )
+
+        self.battery_var = tk.StringVar(
+            value="Battery: --"
+        )
+
+        self.mode_var = tk.StringVar(
+            value="SAFE TEST MODE"
+        )
+
+        self.build_ui()
+
+        self.root.protocol(
+            "WM_DELETE_WINDOW",
+            self.close_app
+        )
+
+        self.add_log(
+            "MouseSentinel V23 initialized."
+        )
+
+        self.add_log(
+            f"Data directory: {BASE_DIR}"
+        )
+
+        if FERNET:
+            self.add_log(
+                "Encrypted event logging: READY"
+            )
+        else:
+            self.add_log(
+                "Encrypted event logging: unavailable"
+            )
+
+        self.update_dashboard()
+
+    # ========================================================
+    # UI
+    # ========================================================
+
+    def build_ui(self):
+
+        # Header
+        header = tk.Frame(
+            self.root,
+            bg="#111827",
+            height=78
+        )
+
+        header.pack(
+            fill="x"
+        )
+
+        tk.Label(
+            header,
+            text="MouseSentinel V23",
+            bg="#111827",
+            fg="white",
+            font=(
+                "Segoe UI",
+                23,
+                "bold"
+            )
+        ).pack(
+            side="left",
+            padx=25,
+            pady=18
+        )
+
+        tk.Label(
+            header,
+            textvariable=self.mode_var,
+            bg="#111827",
+            fg="#fbbf24",
+            font=(
+                "Segoe UI",
+                10,
+                "bold"
+            )
+        ).pack(
+            side="left",
+            padx=15
+        )
+
+        tk.Label(
+            header,
+            textvariable=self.status_var,
+            bg="#111827",
+            fg="#22c55e",
+            font=(
+                "Segoe UI",
+                12,
+                "bold"
+            )
+        ).pack(
+            side="right",
+            padx=25
+        )
+
+        # Main
+        main = tk.Frame(
+            self.root,
+            bg="#e5e7eb"
+        )
+
+        main.pack(
+            fill="both",
+            expand=True
+        )
+
+        # Sidebar
+        sidebar = tk.Frame(
+            main,
+            bg="#1f2937",
+            width=235
+        )
+
+        sidebar.pack(
+            side="left",
+            fill="y"
+        )
+
+        sidebar.pack_propagate(
+            False
+        )
+
+        tk.Label(
+            sidebar,
+            text="SECURITY CENTER",
+            bg="#1f2937",
+            fg="#9ca3af",
+            font=(
+                "Segoe UI",
+                9,
+                "bold"
+            )
+        ).pack(
+            pady=(25, 12)
+        )
+
+        self.side_button(
+            sidebar,
+            "START PROTECTION",
+            self.start
+        )
+
+        self.side_button(
+            sidebar,
+            "STOP PROTECTION",
+            self.stop
+        )
+
+        self.side_button(
+            sidebar,
+            "LOCK WINDOWS",
+            self.lock_now
+        )
+
+        self.side_button(
+            sidebar,
+            "TEST CAMERA",
+            self.test_camera
+        )
+
+        self.side_button(
+            sidebar,
+            "FACE CHECK",
+            self.face_check
+        )
+
+        self.side_button(
+            sidebar,
+            "SETTINGS",
+            self.settings
+        )
+
+        self.side_button(
+            sidebar,
+            "CREATE REPORT",
+            self.export_report
+        )
+
+        self.side_button(
+            sidebar,
+            "SET / CHANGE PIN",
+            self.change_pin
+        )
+
+        # Content
+        content = tk.Frame(
+            main,
+            bg="#e5e7eb"
+        )
+
+        content.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=18,
+            pady=18
+        )
+
+        # Cards
+        cards = tk.Frame(
+            content,
+            bg="#e5e7eb"
+        )
+
+        cards.pack(
+            fill="x"
+        )
+
+        self.create_card(
+            cards,
+            "SECURITY SCORE",
+            self.score_var,
+            0
+        )
+
+        self.create_card(
+            cards,
+            "MOUSE EVENTS",
+            self.mouse_var,
+            1
+        )
+
+        self.create_card(
+            cards,
+            "KEYBOARD EVENTS",
+            self.keyboard_var,
+            2
+        )
+
+        self.create_card(
+            cards,
+            "INACTIVITY",
+            self.inactive_var,
+            3
+        )
+
+        # System box
+        system = tk.Frame(
+            content,
+            bg="white",
+            bd=1,
+            relief="solid"
+        )
+
+        system.pack(
+            fill="x",
+            pady=14
+        )
+
+        tk.Label(
+            system,
+            text="SYSTEM MONITOR",
+            bg="white",
+            fg="#111827",
+            font=(
+                "Segoe UI",
+                12,
+                "bold"
+            )
+        ).pack(
+            anchor="w",
+            padx=15,
+            pady=(12, 7)
+        )
+
+        sysrow = tk.Frame(
+            system,
+            bg="white"
+        )
+
+        sysrow.pack(
+            fill="x",
+            padx=15,
+            pady=(0, 12)
+        )
+
+        for variable in [
+            self.cpu_var,
+            self.ram_var,
+            self.battery_var
+        ]:
+
+            tk.Label(
+                sysrow,
+                textvariable=variable,
+                bg="white",
+                fg="#374151",
+                font=(
+                    "Segoe UI",
+                    10
+                )
+            ).pack(
+                side="left",
+                padx=18
+            )
+
+        # Log box
+        log_frame = tk.Frame(
+            content,
+            bg="#111827"
+        )
+
+        log_frame.pack(
+            fill="both",
+            expand=True
+        )
+
+        tk.Label(
+            log_frame,
+            text="SECURITY EVENT CONSOLE",
+            bg="#111827",
+            fg="#93c5fd",
+            font=(
+                "Segoe UI",
+                11,
+                "bold"
+            )
+        ).pack(
+            anchor="w",
+            padx=15,
+            pady=10
+        )
+
+        self.log_box = tk.Text(
+            log_frame,
+            bg="#020617",
+            fg="#d1fae5",
+            insertbackground="white",
+            font=(
+                "Consolas",
+                10
+            ),
+            wrap="word",
+            relief="flat"
+        )
+
+        self.log_box.pack(
+            fill="both",
+            expand=True,
+            padx=12,
+            pady=(0, 12)
+        )
+
+    def side_button(
+        self,
+        parent,
+        text,
+        command
+    ):
+
+        tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg="#374151",
+            fg="white",
+            activebackground="#4b5563",
+            activeforeground="white",
+            relief="flat",
+            bd=0,
+            font=(
+                "Segoe UI",
+                9,
+                "bold"
+            ),
+            anchor="w",
+            padx=18,
+            pady=10
+        ).pack(
+            fill="x",
+            padx=12,
+            pady=3
+        )
+
+    def create_card(
+        self,
+        parent,
+        title,
+        variable,
+        column
+    ):
+
+        card = tk.Frame(
+            parent,
+            bg="white",
+            height=100,
+            bd=1,
+            relief="solid"
+        )
+
+        card.grid(
+            row=0,
+            column=column,
+            sticky="nsew",
+            padx=4
+        )
+
+        card.grid_propagate(
+            False
+        )
+
+        parent.grid_columnconfigure(
+            column,
+            weight=1
+        )
+
+        tk.Label(
+            card,
+            text=title,
+            bg="white",
+            fg="#6b7280",
+            font=(
+                "Segoe UI",
+                8,
+                "bold"
+            )
+        ).pack(
+            anchor="w",
+            padx=12,
+            pady=(14, 4)
+        )
+
+        tk.Label(
+            card,
+            textvariable=variable,
+            bg="white",
+            fg="#111827",
+            font=(
+                "Segoe UI",
+                18,
+                "bold"
+            )
+        ).pack(
+            anchor="w",
+            padx=12
+        )
+
+    # ========================================================
+    # Console
+    # ========================================================
+
+    def add_log(
+        self,
+        message,
+        event="INFO"
+    ):
+
+        timestamp = datetime.now().strftime(
+            "%H:%M:%S"
+        )
+
+        line = (
+            f"[{timestamp}] "
+            f"{event}: {message}"
+        )
+
+        def update():
+
+            try:
+
+                self.log_box.insert(
+                    "end",
+                    line + "\n"
+                )
+
+                self.log_box.see(
+                    "end"
+                )
+
+            except Exception:
+                pass
+
+        self.root.after(
+            0,
+            update
+        )
+
+        encrypted_log(
+            event,
+            message
+        )
+
+    # ========================================================
+    # Activity callbacks
+    # ========================================================
+
+    def mouse_move(
+        self,
+        x,
+        y
+    ):
+
+        if not self.running:
+            return
+
+        self.mouse_events += 1
+        self.last_activity = time.time()
+
+        if self.mouse_events % 50 == 0:
+
+            self.add_log(
+                f"Mouse activity count: "
+                f"{self.mouse_events}",
+                "ACTIVITY"
+            )
+
+    def mouse_click(
+        self,
+        x,
+        y,
+        button,
+        pressed
+    ):
+
+        if not self.running:
+            return
+
+        if pressed:
+
+            self.mouse_events += 1
+            self.last_activity = time.time()
+
+    def keyboard_press(
+        self,
+        key
+    ):
+
+        if not self.running:
+            return
+
+        self.keyboard_events += 1
+        self.last_activity = time.time()
+
+        # The actual key is intentionally NOT recorded.
+        if self.keyboard_events % 50 == 0:
+
+            self.add_log(
+                f"Keyboard activity count: "
+                f"{self.keyboard_events}",
+                "ACTIVITY"
+            )
+
+    # ========================================================
+    # Protection
+    # ========================================================
+
+    def start(self):
+
+        if self.running:
+
+            messagebox.showinfo(
+                APP_NAME,
+                "Protection is already running."
+            )
+
+            return
+
+        self.running = True
+        self.locking = False
+
+        self.last_activity = time.time()
+
+        self.mouse_listener = mouse.Listener(
+            on_move=self.mouse_move,
+            on_click=self.mouse_click
+        )
+
+        self.keyboard_listener = keyboard.Listener(
+            on_press=self.keyboard_press
+        )
+
+        self.mouse_listener.start()
+        self.keyboard_listener.start()
+
+        self.status_var.set(
+            "PROTECTED"
+        )
+
+        self.mode_var.set(
+            "SAFE TEST MODE"
+            if CONFIG.get(
+                "test_mode",
+                True
+            )
+            else "ACTIVE SECURITY"
+        )
+
+        self.add_log(
+            "Protection started.",
+            "SYSTEM"
+        )
+
+        notify_user(
+            APP_NAME,
+            "Protection started."
+        )
+
+        threading.Thread(
+            target=self.inactivity_monitor,
+            daemon=True
+        ).start()
+
+        threading.Thread(
+            target=self.usb_monitor,
+            daemon=True
+        ).start()
+
+    def stop(self):
+
+        self.running = False
+
+        try:
+            if self.mouse_listener:
+                self.mouse_listener.stop()
+        except Exception:
+            pass
+
+        try:
+            if self.keyboard_listener:
+                self.keyboard_listener.stop()
+        except Exception:
+            pass
+
+        self.status_var.set(
+            "OFFLINE"
+        )
+
+        self.add_log(
+            "Protection stopped.",
+            "SYSTEM"
+        )
+
+    # ========================================================
+    # Inactivity
+    # ========================================================
+
+    def inactivity_monitor(self):
+
+        while self.running:
+
+            elapsed = int(
+                time.time() -
+                self.last_activity
+            )
+
+            timeout = int(
+                CONFIG.get(
+                    "timeout",
+                    300
+                )
+            )
+
+            if (
+                CONFIG.get(
+                    "auto_lock",
+                    False
+                )
+                and elapsed >= timeout
+                and not self.locking
+            ):
+
+                self.security_response(
+                    "INACTIVITY",
+                    f"No activity for {timeout} seconds."
+                )
+
+            time.sleep(1)
+
+    # ========================================================
+    # USB detection
+    # ========================================================
+
+    def get_usb_devices(self):
+
+        devices = set()
+
+        try:
+
+            command = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Get-CimInstance "
+                    "Win32_DiskDrive | "
+                    "Where-Object "
+                    "{$_.InterfaceType -eq 'USB'} | "
+                    "Select-Object -ExpandProperty DeviceID"
+                )
+            ]
+
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            for line in result.stdout.splitlines():
+
+                value = line.strip()
+
+                if value:
+                    devices.add(value)
+
+        except Exception:
+            pass
+
+        return devices
+
+    def usb_monitor(self):
+
+        self.usb_state = (
+            self.get_usb_devices()
+        )
+
+        while self.running:
+
+            current = (
+                self.get_usb_devices()
+            )
+
+            new_devices = (
+                current -
+                self.usb_state
+            )
+
+            if new_devices:
+
+                self.security_events += 1
+
+                self.add_log(
+                    "New USB device detected.",
+                    "USB"
+                )
+
+                notify_user(
+                    APP_NAME,
+                    "New USB storage device detected."
+                )
+
+                if CONFIG.get(
+                    "usb_lock",
+                    False
+                ):
+
+                    self.security_response(
+                        "USB",
+                        "New USB device detected."
+                    )
+
+            self.usb_state = current
+
+            time.sleep(4)
+
+    # ========================================================
+    # Security response
+    # ========================================================
+
+    def security_response(
+        self,
+        reason,
+        details
+    ):
+
+        if self.locking:
+            return
+
+        self.locking = True
+
+        self.security_events += 1
+
+        self.add_log(
+            details,
+            "SECURITY"
+        )
+
+        notify_user(
+            "MouseSentinel Security Alert",
+            f"{reason}: {details}"
+        )
+
+        # Camera capture is optional.
+        self.capture_photo(
+            f"security_{reason.lower()}"
+        )
+
+        alarm()
+
+        # Safe Test Mode never locks Windows.
+        if CONFIG.get(
+            "test_mode",
+            True
+        ):
+
+            self.add_log(
+                "TEST MODE: Windows lock skipped.",
+                "SAFE"
+            )
+
+        else:
+
+            if (
+                CONFIG.get(
+                    "auto_lock",
+                    False
+                )
+                or
+                (
+                    reason == "USB"
+                    and
+                    CONFIG.get(
+                        "usb_lock",
+                        False
+                    )
+                )
+            ):
+
+                time.sleep(1)
+
+                if windows_lock():
+
+                    self.add_log(
+                        "Windows lock requested.",
+                        "LOCK"
+                    )
+
+                else:
+
+                    self.add_log(
+                        "Windows lock request failed.",
+                        "ERROR"
+                    )
+
+        self.last_activity = time.time()
+        self.locking = False
+
+    # ========================================================
+    # Manual lock
+    # ========================================================
+
+    def lock_now(self):
+
+        answer = messagebox.askyesno(
+            APP_NAME,
+            "Windows will be locked now.\n\n"
+            "Continue?"
+        )
+
+        if not answer:
+            return
+
+        self.add_log(
+            "Manual Windows lock requested.",
+            "LOCK"
+        )
+
+        if windows_lock():
+
+            self.add_log(
+                "Windows lock command sent.",
+                "LOCK"
+            )
+
+        else:
+
+            messagebox.showerror(
+                APP_NAME,
+                "Windows lock could not be requested."
+            )
+
+    # ========================================================
+    # Camera
+    # ========================================================
+
+    def capture_photo(
+        self,
+        prefix="capture"
+    ):
+
+        if not CONFIG.get(
+            "camera_capture",
+            True
+        ):
+            return None
+
+        filename = (
+            prefix +
+            "_" +
+            datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            ) +
+            ".jpg"
+        )
+
+        path = (
+            CAPTURE_DIR /
+            filename
+        )
+
+        camera = None
+
+        try:
+
+            camera = cv2.VideoCapture(
+                0
+            )
+
+            if not camera.isOpened():
+
+                self.add_log(
+                    "Camera could not be opened.",
+                    "CAMERA"
+                )
+
+                return None
+
+            time.sleep(
+                0.5
+            )
+
+            ret, frame = (
+                camera.read()
+            )
+
+            if ret:
+
+                cv2.imwrite(
+                    str(path),
+                    frame
+                )
+
+                self.add_log(
+                    f"Photo saved: {filename}",
+                    "CAMERA"
+                )
+
+                return path
+
+        except Exception as error:
+
+            self.add_log(
+                f"Camera error: {error}",
+                "ERROR"
+            )
+
+        finally:
+
+            if camera:
+
+                camera.release()
+
+        return None
+
+    def test_camera(self):
+
+        self.add_log(
+            "Starting camera test.",
+            "CAMERA"
+        )
+
+        path = self.capture_photo(
+            "camera_test"
+        )
+
+        if not path:
+
+            messagebox.showerror(
+                APP_NAME,
+                "Camera test failed.\n\n"
+                "Check Windows Camera permissions."
+            )
+
+            return
+
+        try:
+
+            image = cv2.imread(
+                str(path)
+            )
+
+            if image is not None:
+
+                cv2.imshow(
+                    "MouseSentinel Camera Test",
+                    image
+                )
+
+                cv2.waitKey(
+                    2500
+                )
+
+                cv2.destroyAllWindows()
+
+        except Exception:
+            pass
+
+        messagebox.showinfo(
+            APP_NAME,
+            "Camera test successful.\n\n"
+            f"Saved to:\n{path}"
+        )
+
+    # ========================================================
+    # Face detection
+    # ========================================================
+
+    def face_check(self):
+
+        camera = None
+
+        try:
+
+            camera = cv2.VideoCapture(
+                0
+            )
+
+            if not camera.isOpened():
+
+                messagebox.showerror(
+                    APP_NAME,
+                    "Camera could not be opened."
+                )
+
+                return
+
+            cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades +
+                "haarcascade_frontalface_default.xml"
+            )
+
+            found = False
+            start = time.time()
+
+            while time.time() - start < 8:
+
+                ret, frame = (
+                    camera.read()
+                )
+
+                if not ret:
+                    continue
+
+                gray = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_BGR2GRAY
+                )
+
+                faces = (
+                    cascade.detectMultiScale(
+                        gray,
+                        1.1,
+                        5,
+                        minSize=(80, 80)
+                    )
+                )
+
+                if len(faces) > 0:
+                    found = True
+
+                for x, y, w, h in faces:
+
+                    cv2.rectangle(
+                        frame,
+                        (x, y),
+                        (x + w, y + h),
+                        (0, 255, 0),
+                        2
+                    )
+
+                    cv2.putText(
+                        frame,
+                        "FACE DETECTED",
+                        (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2
+                    )
+
+                cv2.imshow(
+                    "MouseSentinel Face Check",
+                    frame
+                )
+
+                if (
+                    cv2.waitKey(1)
+                    & 0xFF
+                ) == 27:
+
+                    break
+
+            if found:
+
+                self.add_log(
+                    "Face detected.",
+                    "FACE"
+                )
+
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Face detected successfully."
+                )
+
+            else:
+
+                self.add_log(
+                    "No face detected.",
+                    "FACE"
+                )
+
+                messagebox.showwarning(
+                    APP_NAME,
+                    "No face was detected."
+                )
+
+        except Exception as error:
+
+            messagebox.showerror(
+                APP_NAME,
+                f"Face detection error:\n{error}"
+            )
+
+        finally:
+
+            if camera:
+                camera.release()
+
+            cv2.destroyAllWindows()
+
+    # ========================================================
+    # Settings
+    # ========================================================
+
+    def settings(self):
+
+        # PIN protection
+        if CONFIG.get(
+            "pin_hash",
+            ""
+        ):
+
+            pin = simpledialog.askstring(
+                APP_NAME,
+                "Enter security PIN:",
+                show="*"
+            )
+
+            if pin is None:
+                return
+
+            if not verify_pin(pin):
+
+                messagebox.showerror(
+                    APP_NAME,
+                    "Incorrect PIN."
+                )
+
+                return
+
+        win = tk.Toplevel(
+            self.root
+        )
+
+        win.title(
+            "MouseSentinel V23 Settings"
+        )
+
+        win.geometry(
+            "500x600"
+        )
+
+        win.resizable(
+            False,
+            False
+        )
+
+        tk.Label(
+            win,
+            text="Security Settings",
+            font=(
+                "Segoe UI",
+                18,
+                "bold"
+            )
+        ).pack(
+            pady=20
+        )
+
+        body = tk.Frame(win)
+        body.pack(
+            fill="both",
+            expand=True,
+            padx=35
+        )
+
+        tk.Label(
+            body,
+            text="Inactivity timeout (seconds)"
+        ).pack(
+            anchor="w"
+        )
+
+        timeout_var = tk.StringVar(
+            value=str(
+                CONFIG.get(
+                    "timeout",
+                    300
+                )
+            )
+        )
+
+        tk.Entry(
+            body,
+            textvariable=timeout_var,
+            width=25
+        ).pack(
+            anchor="w",
+            pady=(5, 12)
+        )
+
+        vars_ = {
+            "auto_lock": tk.BooleanVar(
+                value=CONFIG.get(
+                    "auto_lock",
+                    False
+                )
+            ),
+
+            "usb_lock": tk.BooleanVar(
+                value=CONFIG.get(
+                    "usb_lock",
+                    False
+                )
+            ),
+
+            "camera_capture": tk.BooleanVar(
+                value=CONFIG.get(
+                    "camera_capture",
+                    True
+                )
+            ),
+
+            "alarm": tk.BooleanVar(
+                value=CONFIG.get(
+                    "alarm",
+                    True
+                )
+            ),
+
+            "notifications": tk.BooleanVar(
+                value=CONFIG.get(
+                    "notifications",
+                    True
+                )
+            ),
+
+            "startup": tk.BooleanVar(
+                value=CONFIG.get(
+                    "startup",
+                    False
+                )
+            ),
+
+            "test_mode": tk.BooleanVar(
+                value=CONFIG.get(
+                    "test_mode",
+                    True
+                )
+            )
+        }
+
+        options = [
+            (
+                "auto_lock",
+                "Enable inactivity auto-lock"
+            ),
+            (
+                "usb_lock",
+                "Lock when new USB storage is detected"
+            ),
+            (
+                "camera_capture",
+                "Enable security webcam snapshots"
+            ),
+            (
+                "alarm",
+                "Enable security alarm"
+            ),
+            (
+                "notifications",
+                "Enable desktop notifications"
+            ),
+            (
+                "startup",
+                "Start MouseSentinel with Windows"
+            ),
+            (
+                "test_mode",
+                "SAFE TEST MODE (recommended initially)"
+            )
+        ]
+
+        for key, text in options:
+
+            tk.Checkbutton(
+                body,
+                text=text,
+                variable=vars_[key]
+            ).pack(
+                anchor="w",
+                pady=5
+            )
+
+        def save():
+
+            try:
+
+                timeout = int(
+                    timeout_var.get()
+                )
+
+                if timeout < 10:
+                    raise ValueError
+
+            except Exception:
+
+                messagebox.showerror(
+                    APP_NAME,
+                    "Timeout must be 10 seconds or more."
+                )
+
+                return
+
+            for key in vars_:
+
+                CONFIG[key] = (
+                    vars_[key].get()
+                )
+
+            CONFIG["timeout"] = timeout
+
+            save_config(
+                CONFIG
+            )
+
+            if CONFIG["startup"]:
+
+                self.enable_startup()
+
+            else:
+
+                self.disable_startup()
+
+            self.add_log(
+                "Settings updated.",
+                "CONFIG"
+            )
+
+            messagebox.showinfo(
+                APP_NAME,
+                "Settings saved."
+            )
+
+            win.destroy()
+
+        tk.Button(
+            win,
+            text="SAVE SETTINGS",
+            command=save,
+            bg="#2563eb",
+            fg="white",
+            font=(
+                "Segoe UI",
+                10,
+                "bold"
+            ),
+            relief="flat",
+            padx=20,
+            pady=10
+        ).pack(
+            pady=20
+        )
+
+    # ========================================================
+    # PIN
+    # ========================================================
+
+    def change_pin(self):
+
+        old_exists = bool(
+            CONFIG.get(
+                "pin_hash",
+                ""
+            )
+        )
+
+        if old_exists:
+
+            old = simpledialog.askstring(
+                APP_NAME,
+                "Current PIN:",
+                show="*"
+            )
+
+            if old is None:
+                return
+
+            if not verify_pin(old):
+
+                messagebox.showerror(
+                    APP_NAME,
+                    "Incorrect current PIN."
+                )
+
+                return
+
+        new_pin = simpledialog.askstring(
+            APP_NAME,
+            "New PIN:",
+            show="*"
+        )
+
+        if not new_pin:
+            return
+
+        if len(new_pin) < 4:
+
+            messagebox.showerror(
+                APP_NAME,
+                "PIN must contain at least 4 characters."
+            )
+
+            return
+
+        pin_hash, salt = (
+            create_pin_hash(
+                new_pin
+            )
+        )
+
+        CONFIG["pin_hash"] = pin_hash
+        CONFIG["pin_salt"] = salt
+
+        save_config(
+            CONFIG
+        )
+
+        self.add_log(
+            "Security PIN changed.",
+            "SECURITY"
+        )
+
+        messagebox.showinfo(
+            APP_NAME,
+            "PIN saved successfully."
+        )
+
+    # ========================================================
+    # Startup
+    # ========================================================
+
+    def enable_startup(self):
+
+        try:
+
+            startup = (
+                Path(
+                    os.environ["APPDATA"]
+                )
+                /
+                "Microsoft"
+                /
+                "Windows"
+                /
+                "Start Menu"
+                /
+                "Programs"
+                /
+                "Startup"
+            )
+
+            startup.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
+            bat = (
+                startup /
+                "MouseSentinel_V23.bat"
+            )
+
+            python_exe = (
+                os.sys.executable
+            )
+
+            script = (
+                Path(
+                    __file__
+                ).resolve()
+            )
+
+            content = (
+                "@echo off\n"
+                f'cd /d "{script.parent}"\n'
+                f'"{python_exe}" "{script}"\n'
+            )
+
+            with open(
+                bat,
+                "w",
+                encoding="utf-8"
+            ) as file:
+
+                file.write(
+                    content
+                )
+
+            self.add_log(
+                "Windows startup enabled.",
+                "STARTUP"
+            )
+
+        except Exception as error:
+
+            self.add_log(
+                f"Startup error: {error}",
+                "ERROR"
+            )
+
+    def disable_startup(self):
+
+        try:
+
+            startup = (
+                Path(
+                    os.environ["APPDATA"]
+                )
+                /
+                "Microsoft"
+                /
+                "Windows"
+                /
+                "Start Menu"
+                /
+                "Programs"
+                /
+                "Startup"
+            )
+
+            bat = (
+                startup /
+                "MouseSentinel_V23.bat"
+            )
+
+            if bat.exists():
+                bat.unlink()
+
+            self.add_log(
+                "Windows startup disabled.",
+                "STARTUP"
+            )
+
+        except Exception:
+            pass
+
+    # ========================================================
+    # Dashboard update
+    # ========================================================
+
+    def update_dashboard(self):
+
+        try:
+
+            cpu = psutil.cpu_percent()
+
+            ram = psutil.virtual_memory()
+
+            self.cpu_var.set(
+                f"CPU: {cpu:.0f}%"
+            )
+
+            self.ram_var.set(
+                f"RAM: {ram.percent:.0f}%"
+            )
+
+            battery = (
+                psutil.sensors_battery()
+            )
+
+            if battery:
+
+                self.battery_var.set(
+                    f"Battery: "
+                    f"{battery.percent:.0f}%"
+                )
+
+            else:
+
+                self.battery_var.set(
+                    "Battery: N/A"
+                )
+
+            self.mouse_var.set(
+                str(
+                    self.mouse_events
+                )
+            )
+
+            self.keyboard_var.set(
+                str(
+                    self.keyboard_events
+                )
+            )
+
+            elapsed = int(
+                time.time()
+                -
+                self.last_activity
+            )
+
+            self.inactive_var.set(
+                f"{elapsed // 60:02d}:"
+                f"{elapsed % 60:02d}"
+            )
+
+            self.score_var.set(
+                f"{self.security_score()}%"
+            )
+
+        except Exception:
+            pass
+
+        if not self.closing:
+
+            self.root.after(
+                2000,
+                self.update_dashboard
+            )
+
+    # ========================================================
+    # Security Score
+    # ========================================================
+
+    def security_score(self):
+
+        score = 100
+
+        if not CONFIG.get(
+            "auto_lock",
+            False
+        ):
+            score -= 15
+
+        if not CONFIG.get(
+            "usb_lock",
+            False
+        ):
+            score -= 10
+
+        if not CONFIG.get(
+            "camera_capture",
+            True
+        ):
+            score -= 5
+
+        if not CONFIG.get(
+            "alarm",
+            True
+        ):
+            score -= 5
+
+        if not CONFIG.get(
+            "notifications",
+            True
+        ):
+            score -= 5
+
+        if not CONFIG.get(
+            "pin_hash",
+            ""
+        ):
+            score -= 10
+
+        return max(
+            0,
+            min(
+                100,
+                score
+            )
+        )
+
+    # ========================================================
+    # Export reports
+    # ========================================================
+
+    def export_report(self):
+
+        records = read_encrypted_logs()
+
+        if not records:
+
+            messagebox.showinfo(
+                APP_NAME,
+                "No encrypted event records available yet."
+            )
+
+            return
+
+        default_name = (
+            "MouseSentinel_V23_Report_"
+            +
+            datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+            +
+            ".txt"
+        )
+
+        destination = (
+            filedialog.asksaveasfilename(
+                title="Save Security Report",
+                initialfile=default_name,
+                defaultextension=".txt",
+                filetypes=[
+                    (
+                        "Text File",
+                        "*.txt"
+                    ),
+                    (
+                        "CSV File",
+                        "*.csv"
+                    )
+                ]
+            )
+        )
+
+        if not destination:
+            return
+
+        try:
+
+            if destination.lower().endswith(
+                ".csv"
+            ):
+
+                with open(
+                    destination,
+                    "w",
+                    newline="",
+                    encoding="utf-8"
+                ) as file:
+
+                    writer = csv.DictWriter(
+                        file,
+                        fieldnames=[
+                            "timestamp",
+                            "event",
+                            "details"
+                        ]
+                    )
+
+                    writer.writeheader()
+
+                    writer.writerows(
+                        records
+                    )
+
+            else:
+
+                with open(
+                    destination,
+                    "w",
+                    encoding="utf-8"
+                ) as file:
+
+                    file.write(
+                        "====================================\n"
+                    )
+
+                    file.write(
+                        "       MouseSentinel V23 REPORT\n"
+                    )
+
+                    file.write(
+                        "====================================\n\n"
+                    )
+
+                    file.write(
+                        f"Generated: {now()}\n"
+                    )
+
+                    file.write(
+                        f"Security Score: "
+                        f"{self.security_score()}%\n"
+                    )
+
+                    file.write(
+                        f"Mouse Events: "
+                        f"{self.mouse_events}\n"
+                    )
+
+                    file.write(
+                        f"Keyboard Events: "
+                        f"{self.keyboard_events}\n"
+                    )
+
+                    file.write(
+                        f"Security Events: "
+                        f"{self.security_events}\n\n"
+                    )
+
+                    file.write(
+                        "EVENT HISTORY\n"
+                    )
+
+                    file.write(
+                        "------------------------------------\n"
+                    )
+
+                    for record in records:
+
+                        file.write(
+                            f"{record.get('timestamp', '')} | "
+                            f"{record.get('event', '')} | "
+                            f"{record.get('details', '')}\n"
+                        )
+
+            self.add_log(
+                f"Report exported: {destination}",
+                "REPORT"
+            )
+
+            messagebox.showinfo(
+                APP_NAME,
+                "Report exported successfully."
+            )
+
+        except Exception as error:
+
+            messagebox.showerror(
+                APP_NAME,
+                f"Report error:\n{error}"
+            )
+
+    # ========================================================
+    # Shutdown
+    # ========================================================
+
+    def close_app(self):
+
+        if self.running:
+
+            answer = messagebox.askyesno(
+                APP_NAME,
+                "Protection is currently running.\n\n"
+                "Stop protection and exit?"
+            )
+
+            if not answer:
+                return
+
+        self.closing = True
+        self.running = False
+
+        try:
+
+            if self.mouse_listener:
+                self.mouse_listener.stop()
+
+        except Exception:
+            pass
+
+        try:
+
+            if self.keyboard_listener:
+                self.keyboard_listener.stop()
+
+        except Exception:
+            pass
+
+        self.root.destroy()
+
+
+# ============================================================
+# Launch
+# ============================================================
+
+def main():
+
+    root = tk.Tk()
+
+    app = MouseSentinel(
+        root
+    )
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
